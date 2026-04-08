@@ -76,6 +76,11 @@ impl ChannelData {
     /// Then try to advance the resolved tail forward.
     fn ingest_raw(&mut self, block_idx: u32, raw: &[u8]) {
         let (first_value, transitions) = extract_block_transitions(raw);
+        self.ingest_precomputed(block_idx, first_value, transitions);
+    }
+
+    /// Ingest pre-extracted block data (used by the background loader path).
+    fn ingest_precomputed(&mut self, block_idx: u32, first_value: u8, transitions: Vec<u32>) {
         self.block_edges.insert(block_idx, BlockEdges { first_value, transitions });
         self.advance_resolved_tail(block_idx);
     }
@@ -115,7 +120,7 @@ impl ChannelData {
 
 /// Extract transitions (bit offsets within the block) from raw bytes.
 /// Returns (first_value, transitions) where first_value is the signal level at bit 0.
-fn extract_block_transitions(raw: &[u8]) -> (u8, Vec<u32>) {
+pub(crate) fn extract_block_transitions(raw: &[u8]) -> (u8, Vec<u32>) {
     if raw.is_empty() {
         return (0, Vec::new());
     }
@@ -255,6 +260,26 @@ impl EdgeStore {
 
     pub fn is_block_ingested(&self, channel_idx: u32, block_idx: u32) -> bool {
         self.ingested.contains(&(channel_idx, block_idx))
+    }
+
+    /// Apply a block result produced by the background loader.
+    /// Must only be called from the render thread.
+    pub fn apply_loaded(&mut self, result: crate::waveform::loader::LoadResult) {
+        if self.ingested.contains(&(result.channel_idx, result.block_idx)) {
+            return;
+        }
+        if result.block_idx == 0 {
+            self.channel_first_values[result.channel_idx as usize] = result.first_value;
+        }
+        self.channels[result.channel_idx as usize]
+            .ingest_precomputed(result.block_idx, result.first_value, result.transitions);
+        self.ingested.insert((result.channel_idx, result.block_idx));
+        debug!("applied block ch={} blk={}", result.channel_idx, result.block_idx);
+    }
+
+    /// Clone the zip name-to-index map for use by the background loader thread.
+    pub fn clone_name_to_index(&self) -> HashMap<String, usize> {
+        self.name_to_index.clone()
     }
 
     /// Returns the resolved SparseChannel for a given channel.

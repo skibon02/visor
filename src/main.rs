@@ -127,7 +127,7 @@ impl App {
         self.projects = entries;
     }
 
-    fn load_selected(&mut self) {
+    fn load_selected(&mut self, ctx: &egui::Context) {
         if let Some(idx) = self.selected {
             if let Some(entry) = self.projects.get(idx) {
                 let path = entry.path.clone();
@@ -139,7 +139,7 @@ impl App {
                             project.header.total_probes,
                             project.header.total_blocks,
                             project.duration_secs);
-                        match WaveformState::from_project(path.clone(), project) {
+                        match WaveformState::from_project(path.clone(), project, ctx.clone()) {
                             Ok(wf) => Some(wf),
                             Err(e) => { warn!("waveform init failed: {e}"); None }
                         }
@@ -257,7 +257,7 @@ impl eframe::App for App {
                     if self.selected != Some(i) {
                         self.selected = Some(i);
                         self.loaded = None;
-                        self.load_selected();
+                        self.load_selected(ctx);
                     }
                 }
 

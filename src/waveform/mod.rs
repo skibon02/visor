@@ -1,10 +1,15 @@
 mod edges;
+mod loader;
 mod viewport;
 mod qspi_stats;
+
+use std::collections::HashSet;
+use std::sync::mpsc;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use edges::EdgeStore;
+use loader::{LoadRequest, LoadResult, spawn_loader};
 use viewport::{RenderLayout, ViewState, LABEL_WIDTH_PX, LANE_HEIGHT_PX};
 use qspi_stats::PacketStats;
 
@@ -93,20 +98,29 @@ pub struct WaveformState {
     transactions: Vec<Transaction>,
     transactions_config_gen: u64,
     qspi_config_gen: u64,
+    /// How many CS blocks were ingested when transactions were last built.
+    /// Rebuilt whenever more CS blocks arrive.
+    cs_blocks_at_last_tx_build: u32,
     packet_stats: Option<PacketStats>,
     stats_config_gen: u64,
+    exclude_timing_outliers: bool,
+    loader_tx: mpsc::SyncSender<LoadRequest>,
+    loader_res_rx: mpsc::Receiver<LoadResult>,
+    requested: HashSet<(u32, u32)>,
+    _loader_handle: std::thread::JoinHandle<()>,
 }
 
 impl WaveformState {
     pub fn from_project(
         path: std::path::PathBuf,
         project: &DslProject,
+        ctx: egui::Context,
     ) -> Result<Self, String> {
         let num_channels = project.header.total_probes as usize;
         let blocks_per_channel = project.header.total_blocks;
         let total_samples = project.header.total_samples;
 
-        let store = EdgeStore::open(path, num_channels as u32, blocks_per_channel, total_samples)?;
+        let store = EdgeStore::open(path.clone(), num_channels as u32, blocks_per_channel, total_samples)?;
         let view = ViewState::new(total_samples);
 
         let channel_names: Vec<String> = if !project.channels.is_empty() {
@@ -118,6 +132,11 @@ impl WaveformState {
         let qspi = QspiConfig::new(num_channels);
         let samplerate_hz = project.header.samplerate_hz;
 
+        let name_to_index = store.clone_name_to_index();
+        let (loader_tx, req_rx) = mpsc::sync_channel::<LoadRequest>(256);
+        let (res_tx, loader_res_rx) = mpsc::channel::<LoadResult>();
+        let handle = spawn_loader(path, name_to_index, req_rx, res_tx, ctx);
+
         Ok(Self {
             view,
             store,
@@ -127,8 +146,14 @@ impl WaveformState {
             transactions: Vec::new(),
             transactions_config_gen: 0,
             qspi_config_gen: 1,
+            cs_blocks_at_last_tx_build: 0,
             packet_stats: None,
             stats_config_gen: 0,
+            exclude_timing_outliers: false,
+            loader_tx,
+            loader_res_rx,
+            requested: HashSet::new(),
+            _loader_handle: handle,
         })
     }
 
@@ -178,6 +203,7 @@ impl WaveformState {
 
         // ---- Packet stats ----
         if self.qspi.enabled {
+            let mut toggle_exclude_timing_outliers = false;
             egui::CollapsingHeader::new("Packet Stats")
                 .default_open(true)
                 .show(ui, |ui| {
@@ -192,10 +218,10 @@ impl WaveformState {
                         Some(stats) => {
                             // Summary line
                             let total = stats.packets.len();
-                            let threshold = (total as f32 * 0.01) as usize;
+                            let outlier_threshold = ((total as f32 * 0.06) as usize).max(1);
                             let outliers: usize = stats.groups.values()
                                 .map(|v| v.len())
-                                .filter(|&c| c < threshold)
+                                .filter(|&c| c < outlier_threshold)
                                 .sum();
                             ui.horizontal(|ui| {
                                 ui.label(format!("Packets: {}", total));
@@ -207,7 +233,7 @@ impl WaveformState {
                                 } else {
                                     Color32::from_rgb(220, 80, 80)
                                 };
-                                ui.colored_label(outlier_color, format!("Outliers (<1%): {}", outliers));
+                                ui.colored_label(outlier_color, format!("Outliers (<6%): {}", outliers));
                             });
 
                             ui.add_space(4.0);
@@ -230,7 +256,7 @@ impl WaveformState {
                                     for ((byte_count, crc), tx_indices) in &rows {
                                         let count = tx_indices.len();
                                         let pct = count as f32 / total as f32 * 100.0;
-                                        let is_outlier = count < threshold;
+                                        let is_outlier = count < outlier_threshold;
                                         let row_color = if is_outlier {
                                             Color32::from_rgb(220, 80, 80)
                                         } else {
@@ -261,9 +287,148 @@ impl WaveformState {
                                         ui.end_row();
                                     }
                                 });
+
+                            // ---- Timing distribution ----
+                            if let Some(ref t) = stats.timing {
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Inter-frame timing").strong());
+                                    if !t.period_outliers.is_empty() {
+                                        ui.separator();
+                                        let mut checked = self.exclude_timing_outliers;
+                                        if ui.checkbox(&mut checked, "Exclude period outliers from histogram").changed() {
+                                            toggle_exclude_timing_outliers = true;
+                                        }
+                                    }
+                                });
+
+                                // Period outliers list
+                                if !t.period_outliers.is_empty() {
+                                    let outlier_count = t.period_outliers.len();
+                                    let period_outliers: Vec<(usize, f64)> = t.period_outliers.iter()
+                                        .map(|&(tx_a, _, v)| (tx_a, v))
+                                        .collect();
+                                    egui::CollapsingHeader::new(
+                                        egui::RichText::new(format!("Period outliers (≥2× median): {}", outlier_count))
+                                            .color(Color32::from_rgb(220, 140, 60))
+                                    )
+                                    .id_salt("period_outliers")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .max_height(120.0)
+                                            .id_salt("period_outliers_scroll")
+                                            .show(ui, |ui| {
+                                                let mut jump_to: Option<u64> = None;
+                                                for &(tx_a, interval_us) in &period_outliers {
+                                                    ui.horizontal(|ui| {
+                                                        ui.colored_label(
+                                                            Color32::from_rgb(220, 140, 60),
+                                                            format!("tx#{} → #{}: {:.1}µs", tx_a, tx_a + 1, interval_us),
+                                                        );
+                                                        if ui.small_button("Jump").clicked() {
+                                                            if let Some(tx) = self.transactions.get(tx_a + 1) {
+                                                                jump_to = Some(tx.start);
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                                if let Some(start) = jump_to {
+                                                    self.view.sample_offset = start.saturating_sub(
+                                                        (100.0 * self.view.samples_per_pixel) as u64
+                                                    );
+                                                }
+                                            });
+                                    });
+                                }
+
+                                ui.horizontal(|ui| {
+                                    if t.histogram_excludes_outliers {
+                                        ui.colored_label(Color32::from_rgb(180, 140, 60), "(outliers excluded)");
+                                        ui.separator();
+                                    }
+                                    ui.label(format!("min {:.1}µs", t.min_us));
+                                    ui.separator();
+                                    ui.label(format!("p50 {:.1}µs", t.p50_us));
+                                    ui.separator();
+                                    ui.label(format!("p95 {:.1}µs", t.p95_us));
+                                    ui.separator();
+                                    ui.label(format!("p99 {:.1}µs", t.p99_us));
+                                    ui.separator();
+                                    ui.label(format!("max {:.1}µs", t.max_us));
+                                    ui.separator();
+                                    ui.label(format!("mean {:.1}µs", t.mean_us));
+                                });
+
+                                // Histogram bar chart
+                                let max_count = t.histogram.iter().map(|b| b.1).max().unwrap_or(1).max(1);
+                                let bar_area = ui.available_width().min(600.0);
+                                let bar_w = (bar_area / t.histogram.len() as f32).max(1.0);
+                                let bar_h = 48.0;
+
+                                let (resp, painter) = ui.allocate_painter(
+                                    Vec2::new(bar_w * t.histogram.len() as f32, bar_h + 14.0),
+                                    Sense::hover(),
+                                );
+                                let rect = resp.rect;
+
+                                for (i, &(bucket_us, count)) in t.histogram.iter().enumerate() {
+                                    let fill_frac = count as f32 / max_count as f32;
+                                    let x = rect.left() + i as f32 * bar_w;
+                                    let bar_top = rect.top() + bar_h * (1.0 - fill_frac);
+                                    let bar_rect = Rect::from_min_max(
+                                        Pos2::new(x, bar_top),
+                                        Pos2::new(x + bar_w - 1.0, rect.top() + bar_h),
+                                    );
+
+                                    let color = if bucket_us >= t.p99_us {
+                                        Color32::from_rgb(220, 80, 80)
+                                    } else if bucket_us >= t.p95_us {
+                                        Color32::from_rgb(220, 160, 60)
+                                    } else {
+                                        Color32::from_rgb(80, 140, 220)
+                                    };
+                                    painter.rect_filled(bar_rect, 0.0, color);
+
+                                    if i == 0 || i == t.histogram.len() / 2 || i == t.histogram.len() - 1 {
+                                        painter.text(
+                                            Pos2::new(x + bar_w / 2.0, rect.top() + bar_h + 2.0),
+                                            egui::Align2::CENTER_TOP,
+                                            format!("{:.0}", bucket_us),
+                                            FontId::proportional(9.0),
+                                            Color32::from_rgb(140, 140, 140),
+                                        );
+                                    }
+                                }
+
+                                // p50/p95/p99 marker lines
+                                for (pct_us, label, color) in [
+                                    (t.p50_us, "p50", Color32::from_rgb(100, 200, 100)),
+                                    (t.p95_us, "p95", Color32::from_rgb(220, 160, 60)),
+                                    (t.p99_us, "p99", Color32::from_rgb(220, 80, 80)),
+                                ] {
+                                    let range = (t.max_us - t.min_us).max(1.0);
+                                    let x = rect.left() + ((pct_us - t.min_us) / range) as f32 * bar_w * t.histogram.len() as f32;
+                                    painter.line_segment(
+                                        [Pos2::new(x, rect.top()), Pos2::new(x, rect.top() + bar_h)],
+                                        Stroke::new(1.0, color),
+                                    );
+                                    painter.text(
+                                        Pos2::new(x + 2.0, rect.top() + 1.0),
+                                        egui::Align2::LEFT_TOP,
+                                        label,
+                                        FontId::proportional(8.0),
+                                        color,
+                                    );
+                                }
+                            }
                         }
                     }
                 });
+            if toggle_exclude_timing_outliers {
+                self.exclude_timing_outliers = !self.exclude_timing_outliers;
+                self.stats_config_gen = self.stats_config_gen.wrapping_sub(1);
+            }
         }
 
         // ---- Waveform area ----
@@ -302,38 +467,72 @@ impl WaveformState {
         let layout = self.view.layout([rect.width(), rect.height()], num_channels);
         self.preload_viewport(&layout);
 
-        // Rebuild transaction list when config changes and CS channel data is available
-        if self.qspi.enabled && self.transactions_config_gen != self.qspi_config_gen {
+        // When QSPI is enabled, eagerly load all CS blocks so transactions are discovered
+        // across the full recording, not just the visible viewport.
+        if self.qspi.enabled {
             if let Some(cs_ch) = self.qspi.channel_for(QspiRole::Cs) {
-                if self.store.is_block_ingested(cs_ch as u32, 0) {
+                for blk in 0..self.store.blocks_per_channel {
+                    self.request_block(cs_ch as u32, blk);
+                }
+            }
+        }
+
+        // Rebuild transaction list when config changes OR when new CS blocks have been loaded.
+        if self.qspi.enabled {
+            if let Some(cs_ch) = self.qspi.channel_for(QspiRole::Cs) {
+                let cs_loaded: u32 = (0..self.store.blocks_per_channel)
+                    .filter(|&b| self.store.is_block_ingested(cs_ch as u32, b))
+                    .count() as u32;
+                let config_changed = self.transactions_config_gen != self.qspi_config_gen;
+                let more_data = cs_loaded > self.cs_blocks_at_last_tx_build;
+                if (config_changed || more_data) && cs_loaded > 0 {
                     self.transactions = find_transactions(&self.store, &self.qspi);
                     self.transactions_config_gen = self.qspi_config_gen;
-                    // Invalidate stats when transactions change
-                    self.stats_config_gen = self.qspi_config_gen.wrapping_sub(1);
+                    self.cs_blocks_at_last_tx_build = cs_loaded;
+                    // Invalidate stats — transaction list changed
+                    self.stats_config_gen = self.transactions_config_gen.wrapping_sub(1);
                     self.packet_stats = None;
                 }
             }
         }
 
-        // Compute packet stats once all required blocks are loaded.
-        // We check that the CLK channel has all blocks ingested up to the last transaction.
+        // Trigger full recording load for stats — one block per frame to avoid stalling.
         if self.qspi.enabled
             && !self.transactions.is_empty()
             && self.stats_config_gen != self.transactions_config_gen
         {
-            if let Some(clk_ch) = self.qspi.channel_for(QspiRole::Clk) {
+            if let (Some(clk_ch), Some(cs_ch), Some(d0_ch), Some(d1_ch), Some(d2_ch), Some(d3_ch)) = (
+                self.qspi.channel_for(QspiRole::Clk),
+                self.qspi.channel_for(QspiRole::Cs),
+                self.qspi.channel_for(QspiRole::D0),
+                self.qspi.channel_for(QspiRole::D1),
+                self.qspi.channel_for(QspiRole::D2),
+                self.qspi.channel_for(QspiRole::D3),
+            ) {
                 let last_tx_end = self.transactions.last().map(|t| t.end).unwrap_or(0);
                 let last_block = (last_tx_end / edges::SAMPLES_PER_BLOCK)
                     .min(self.store.blocks_per_channel as u64 - 1) as u32;
-                let all_loaded = (0..=last_block)
-                    .all(|b| self.store.is_block_ingested(clk_ch as u32, b));
+                let needed_chs = [clk_ch as u32, cs_ch as u32, d0_ch as u32, d1_ch as u32, d2_ch as u32, d3_ch as u32];
+                let all_loaded = needed_chs.iter().all(|&ch|
+                    (0..=last_block).all(|b| self.store.is_block_ingested(ch, b))
+                );
                 if all_loaded {
                     self.packet_stats = Some(PacketStats::compute(
                         &self.store,
                         &self.qspi,
                         &self.transactions,
+                        self.samplerate_hz,
+                        self.exclude_timing_outliers,
                     ));
                     self.stats_config_gen = self.transactions_config_gen;
+                } else {
+                    // Queue all missing blocks — loader thread processes them in background
+                    for b in 0..=last_block {
+                        for &ch in &needed_chs {
+                            self.request_block(ch, b);
+                        }
+                    }
+                    ui.ctx().request_repaint();
                 }
             }
         }
@@ -456,10 +655,41 @@ impl WaveformState {
     }
 
     fn preload_viewport(&mut self, layout: &RenderLayout) {
-        self.store.ensure_range(
-            layout.first_sample,
-            layout.first_sample + layout.viewport_samples,
-        );
+        self.drain_loader_results();
+
+        let start = layout.first_sample;
+        let end = layout.first_sample + layout.viewport_samples;
+        let first_block = (start / edges::SAMPLES_PER_BLOCK) as u32;
+        let last_block = ((end.saturating_sub(1)) / edges::SAMPLES_PER_BLOCK)
+            .min(self.store.blocks_per_channel as u64 - 1) as u32;
+
+        for ch in 0..self.store.num_channels {
+            self.request_block(ch, 0);
+            for blk in first_block..=last_block {
+                self.request_block(ch, blk);
+            }
+        }
+    }
+
+    fn request_block(&mut self, channel_idx: u32, block_idx: u32) {
+        if self.store.is_block_ingested(channel_idx, block_idx) {
+            return;
+        }
+        let key = (channel_idx, block_idx);
+        if self.requested.contains(&key) {
+            return;
+        }
+        self.requested.insert(key);
+        if self.loader_tx.try_send(LoadRequest::LoadBlock { channel_idx, block_idx }).is_err() {
+            // Channel full — remove from requested so it's retried next frame
+            self.requested.remove(&key);
+        }
+    }
+
+    fn drain_loader_results(&mut self) {
+        while let Ok(result) = self.loader_res_rx.try_recv() {
+            self.store.apply_loaded(result);
+        }
     }
 
     fn has_missing_data(&self, layout: &RenderLayout) -> bool {
@@ -529,7 +759,10 @@ fn draw_transaction_lines(
 
     let stroke = Stroke::new(1.0, TRANSACTION_LINE_COLOR);
 
-    // Binary search to find transactions that overlap the viewport
+    // Minimum pixel gap between drawn lines — skip when transactions are denser than this.
+    const MIN_LINE_GAP_PX: f32 = 4.0;
+    let mut last_x = f32::NEG_INFINITY;
+
     let first_idx = transactions.partition_point(|t| t.end < first_sample);
     for t in &transactions[first_idx..] {
         if t.start > last_sample {
@@ -537,11 +770,13 @@ fn draw_transaction_lines(
         }
         let x_start = sample_to_x(t.start);
         let x_end = sample_to_x(t.end);
-        if x_start >= rect.left() && x_start <= rect.right() {
+        if x_start >= rect.left() && x_start <= rect.right() && x_start >= last_x + MIN_LINE_GAP_PX {
             painter.line_segment([Pos2::new(x_start, rect.top()), Pos2::new(x_start, rect.bottom())], stroke);
+            last_x = x_start;
         }
-        if x_end >= rect.left() && x_end <= rect.right() {
+        if x_end >= rect.left() && x_end <= rect.right() && x_end >= last_x + MIN_LINE_GAP_PX {
             painter.line_segment([Pos2::new(x_end, rect.top()), Pos2::new(x_end, rect.bottom())], stroke);
+            last_x = x_end;
         }
     }
 }
